@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 
@@ -30,15 +31,29 @@
 
 #include <time.h>
 
+#ifdef BOARD_USE_CUSTOM_RECOVERY_FONT
+#include BOARD_USE_CUSTOM_RECOVERY_FONT
+#else
 #include "font_10x18.h"
+#endif
+
 #include "minui.h"
 #include "graphics.h"
 
+
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(x) (sizeof(x)/sizeof(x[0]))
+#endif
+
 typedef struct {
-    GRSurface* texture;
-    int cwidth;
-    int cheight;
-} GRFont;
+    char        name[80];
+    GRFont*     font;
+} font_item;
+
+static font_item gr_fonts[] = {
+    { "menu", NULL },
+    { "log", NULL },
+};
 
 static GRFont* gr_font = NULL;
 static minui_backend* gr_backend = NULL;
@@ -72,15 +87,44 @@ void gr_font_size(int *x, int *y)
     *y = gr_font->cheight;
 }
 
-static void text_blend(unsigned char* src_p, int src_row_bytes,
+static void icon_blend_alpha(unsigned char* src_p,int src_row_bytes,
                        unsigned char* dst_p, int dst_row_bytes,
-                       int width, int height)
-{
-    int i, j;
+                       int width, int height){
+    int i,j;
+    unsigned char r,g,b,a;
+
     for (j = 0; j < height; ++j) {
         unsigned char* sx = src_p;
         unsigned char* px = dst_p;
         for (i = 0; i < width; ++i) {
+             r  = *sx++;
+             g = *sx++;
+             b = *sx++;
+             a = *sx++;
+
+             *px = (*px * (255-a) + r * a )/ 255;
+             ++px;
+
+             *px = (*px * (255-a) + g * a) / 255;
+             ++px;
+
+             *px = (*px * (255-a) + b * a) / 255;
+
+             ++px;
+             ++px;
+        }
+        src_p += src_row_bytes;
+        dst_p += dst_row_bytes;
+    }
+}
+static void text_blend(unsigned char* src_p, int src_row_bytes,
+                       unsigned char* dst_p, int dst_row_bytes,
+                       int width, int height)
+{
+    for (int j = 0; j < height; ++j) {
+        unsigned char* sx = src_p;
+        unsigned char* px = dst_p;
+        for (int i = 0; i < width; ++i) {
             unsigned char a = *sx++;
             if (gr_current_a < 255) a = ((int)a * gr_current_a) / 255;
             if (a == 255) {
@@ -105,34 +149,78 @@ static void text_blend(unsigned char* src_p, int src_row_bytes,
     }
 }
 
+/* Add text_blend one bitmap buffer */
+void gr_text_blend(int x,int y, GRFont* font)
+{
+    if (font == NULL ||font->texture==NULL  || outside(x, y) || outside(x+font->cwidth-1, y+font->cheight-1))
+        return;
+
+    unsigned char* src_p = font->texture->data;
+    int offset = y * gr_draw->row_bytes + x * gr_draw->pixel_bytes;
+    unsigned char *dst_p = gr_draw->data+offset;
+
+    text_blend(src_p,font->cwidth,dst_p,gr_draw->row_bytes,font->cwidth,font->cheight);
+}
+
+static int rainbow_index = 0;
+static int rainbow_enabled = 0;
+static int rainbow_colors[] = { 255, 0, 0,        // red
+                                255, 127, 0,      // orange
+                                255, 255, 0,      // yellow
+                                0, 255, 0,        // green
+                                60, 80, 255,      // blue
+                                143, 0, 255 };    // violet
+static int num_rb_colors =
+        (sizeof(rainbow_colors)/sizeof(rainbow_colors[0])) / 3;
+
+static void rainbow(int col) {
+    int rainbow_color = ((rainbow_index + col) % num_rb_colors) * 3;
+    gr_color(rainbow_colors[rainbow_color], rainbow_colors[rainbow_color+1],
+                rainbow_colors[rainbow_color+2], 255);
+}
+
+void set_rainbow_mode(int enabled) {
+    rainbow_enabled = enabled;
+}
+
+void move_rainbow(int x) {
+    rainbow_index += x;
+    if (rainbow_index < 0) {
+        rainbow_index = num_rb_colors - 1;
+    } else if (rainbow_index >= num_rb_colors) {
+        rainbow_index = 0;
+    }
+}
 
 void gr_text(int x, int y, const char *s, int bold)
 {
-    GRFont *font = gr_font;
-    unsigned off;
+    GRFont* font = gr_font;
 
-    if (!font->texture) return;
-    if (gr_current_a == 0) return;
+    if (!font->texture || gr_current_a == 0) return;
 
     bold = bold && (font->texture->height != font->cheight);
 
     x += overscan_offset_x;
     y += overscan_offset_y;
 
-    while((off = *s++)) {
-        off -= 32;
+    unsigned char ch;
+    while ((ch = *s++)) {
+        if (rainbow_enabled) rainbow(x / font->cwidth);
+
         if (outside(x, y) || outside(x+font->cwidth-1, y+font->cheight-1)) break;
-        if (off < 96) {
 
-            unsigned char* src_p = font->texture->data + (off * font->cwidth) +
-                (bold ? font->cheight * font->texture->row_bytes : 0);
-            unsigned char* dst_p = gr_draw->data + y*gr_draw->row_bytes + x*gr_draw->pixel_bytes;
-
-            text_blend(src_p, font->texture->row_bytes,
-                       dst_p, gr_draw->row_bytes,
-                       font->cwidth, font->cheight);
-
+        if (ch < ' ' || ch > '~') {
+            ch = '?';
         }
+
+        unsigned char* src_p = font->texture->data + ((ch - ' ') * font->cwidth) +
+                               (bold ? font->cheight * font->texture->row_bytes : 0);
+        unsigned char* dst_p = gr_draw->data + y*gr_draw->row_bytes + x*gr_draw->pixel_bytes;
+
+        text_blend(src_p, font->texture->row_bytes,
+                   dst_p, gr_draw->row_bytes,
+                   font->cwidth, font->cheight);
+
         x += font->cwidth;
     }
 }
@@ -160,22 +248,27 @@ void gr_texticon(int x, int y, GRSurface* icon) {
 
 void gr_color(unsigned char r, unsigned char g, unsigned char b, unsigned char a)
 {
+#if defined(RECOVERY_ABGR) || defined(RECOVERY_BGRA)
+    gr_current_r = b;
+    gr_current_g = g;
+    gr_current_b = r;
+    gr_current_a = a;
+#else
     gr_current_r = r;
     gr_current_g = g;
     gr_current_b = b;
     gr_current_a = a;
+#endif
 }
 
 void gr_clear()
 {
-    if (gr_current_r == gr_current_g &&
-        gr_current_r == gr_current_b) {
+    if (gr_current_r == gr_current_g && gr_current_r == gr_current_b) {
         memset(gr_draw->data, gr_current_r, gr_draw->height * gr_draw->row_bytes);
     } else {
-        int x, y;
         unsigned char* px = gr_draw->data;
-        for (y = 0; y < gr_draw->height; ++y) {
-            for (x = 0; x < gr_draw->width; ++x) {
+        for (int y = 0; y < gr_draw->height; ++y) {
+            for (int x = 0; x < gr_draw->width; ++x) {
                 *px++ = gr_current_r;
                 *px++ = gr_current_g;
                 *px++ = gr_current_b;
@@ -227,6 +320,17 @@ void gr_fill(int x1, int y1, int x2, int y2)
     }
 }
 
+void gr_set_font(const char* name)
+{
+    unsigned int idx;
+    for (idx = 0; idx < ARRAY_SIZE(gr_fonts); ++idx) {
+        if (strcmp(name, gr_fonts[idx].name) == 0) {
+            gr_font = gr_fonts[idx].font;
+            break;
+        }
+    }
+}
+
 void gr_blit(GRSurface* source, int sx, int sy, int w, int h, int dx, int dy) {
     if (source == NULL) return;
 
@@ -243,12 +347,30 @@ void gr_blit(GRSurface* source, int sx, int sy, int w, int h, int dx, int dy) {
     unsigned char* src_p = source->data + sy*source->row_bytes + sx*source->pixel_bytes;
     unsigned char* dst_p = gr_draw->data + dy*gr_draw->row_bytes + dx*gr_draw->pixel_bytes;
 
-    int i;
-    for (i = 0; i < h; ++i) {
+    for (int i = 0; i < h; ++i) {
         memcpy(dst_p, src_p, w * source->pixel_bytes);
         src_p += source->row_bytes;
         dst_p += gr_draw->row_bytes;
     }
+}
+
+void gr_blend(GRSurface* source, int sx, int sy, int w, int h, int dx, int dy) {
+    if (source == NULL) return;
+
+    if (gr_draw->pixel_bytes != source->pixel_bytes) {
+        printf("gr_blit: source has wrong format\n");
+        return;
+    }
+
+    dx += overscan_offset_x;
+    dy += overscan_offset_y;
+
+    if (outside(dx, dy) || outside(dx+w-1, dy+h-1)) return;
+
+    unsigned char* src_p = source->data + sy*source->row_bytes + sx*source->pixel_bytes;
+    unsigned char* dst_p = gr_draw->data + dy*gr_draw->row_bytes + dx*gr_draw->pixel_bytes;
+
+    icon_blend_alpha(src_p, source->row_bytes, dst_p, gr_draw->row_bytes, w, h);
 }
 
 unsigned int gr_get_width(GRSurface* surface) {
@@ -265,11 +387,14 @@ unsigned int gr_get_height(GRSurface* surface) {
     return surface->height;
 }
 
-static void gr_init_font(void)
+static void gr_init_one_font(int idx)
 {
-    gr_font = calloc(sizeof(*gr_font), 1);
+    char name[80];
+    GRFont* gr_font = calloc(sizeof(*gr_font), 1);
+    snprintf(name, sizeof(name), "font_%s", gr_fonts[idx].name);
+    gr_fonts[idx].font = gr_font;
 
-    int res = res_create_alpha_surface("font", &(gr_font->texture));
+    int res = res_create_alpha_surface(name, &(gr_font->texture));
     if (res == 0) {
         // The font image should be a 96x2 array of character images.  The
         // columns are the printable ASCII characters 0x20 - 0x7f.  The
@@ -299,6 +424,15 @@ static void gr_init_font(void)
         gr_font->cwidth = font.cwidth;
         gr_font->cheight = font.cheight;
     }
+}
+
+static void gr_init_font()
+{
+    unsigned int idx;
+    for (idx = 0; idx < ARRAY_SIZE(gr_fonts); ++idx) {
+        gr_init_one_font(idx);
+    }
+    gr_font = gr_fonts[0].font;
 }
 
 #if 0
